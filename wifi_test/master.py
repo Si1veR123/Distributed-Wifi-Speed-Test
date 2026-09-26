@@ -52,6 +52,7 @@ class _Client:
         self.sock = sock
         self.address = address
         self.device = None
+        self.speed_available = None
 
 
 class MasterServer:
@@ -99,9 +100,14 @@ class MasterServer:
                 kind = message.get("type")
                 if kind == protocol.MSG_HELLO:
                     client.device = message.get("device") or client.address[0]
+                    client.speed_available = message.get("speedtest")
                     with self._clients_lock:
                         self._clients[client.device] = client
-                    print(f"[master] slave connected: {client.device} ({client.address[0]})")
+                    note = ""
+                    if client.speed_available is False:
+                        note = "  [no Ookla speedtest - speed tests skipped]"
+                    print(f"[master] slave connected: {client.device} "
+                          f"({client.address[0]}){note}")
                 elif kind == protocol.MSG_RESULT:
                     self._queue.put(("result", client.device, message))
                 elif kind == protocol.MSG_ROUND_DONE:
@@ -117,11 +123,29 @@ class MasterServer:
                 with self._clients_lock:
                     if self._clients.get(client.device) is client:
                         del self._clients[client.device]
+                # Let an in-progress round stop waiting for this device.
+                self._queue.put(("disconnect", client.device, None))
                 print(f"[master] slave disconnected: {client.device}")
 
     def connected_devices(self):
         with self._clients_lock:
             return list(self._clients.keys())
+
+    def clients_snapshot(self):
+        """Return ``{device: speed_available}`` for the connected slaves."""
+        with self._clients_lock:
+            return {name: client.speed_available for name, client in self._clients.items()}
+
+    def send_to(self, device, message):
+        with self._clients_lock:
+            client = self._clients.get(device)
+        if client is None:
+            return False
+        try:
+            protocol.send_message(client.sock, message)
+            return True
+        except OSError:
+            return False
 
     def broadcast(self, message):
         with self._clients_lock:
@@ -135,22 +159,30 @@ class MasterServer:
     def submit(self, event, device, payload):
         self._queue.put((event, device, payload))
 
-    def wait_for(self, expected, deadline, on_result):
-        """Drain the queue until *expected* done-events arrive or the deadline passes."""
-        done = set()
-        while len(done) < expected and time.time() < deadline and not self._stop.is_set():
-            remaining = deadline - time.time()
+    def wait_for(self, devices, deadline, on_result):
+        """Wait for every device in *devices* to finish, until the deadline.
+
+        Returns the set of devices that never reported.  A slave that drops
+        out mid-round is removed immediately so the round does not stall for
+        the full round timeout.
+        """
+        remaining = set(devices)
+        while remaining and time.time() < deadline and not self._stop.is_set():
+            wait = min(0.5, max(0.05, deadline - time.time()))
             try:
-                event, device, payload = self._queue.get(
-                    timeout=min(0.5, max(0.05, remaining))
-                )
+                event, device, payload = self._queue.get(timeout=wait)
             except queue.Empty:
                 continue
             if event == "done":
-                done.add(device)
+                remaining.discard(device)
+            elif event == "disconnect":
+                if device in remaining:
+                    remaining.discard(device)
+                    print(f"[master] {device} disconnected mid-round; "
+                          "not waiting for it")
             else:
                 on_result(device, payload)
-        return done
+        return remaining
 
     def stop(self):
         self._stop.set()
@@ -185,10 +217,18 @@ def measure_once(params):
 
     speed_stats = None
     if params.get("speed"):
+        # Stagger the speed tests so they do not corrupt each other or the
+        # speedtest server selection by all running at once.
+        delay = float(params.get("speed_delay") or 0.0)
+        if delay > 0:
+            time.sleep(delay)
         try:
-            speed_stats = speed_module.run_speedtest()
-        except Exception as exc:  # speedtest-cli raises a variety of errors
-            speed_stats = {"error": f"speedtest failed: {exc}"}
+            speed_stats = speed_module.run_speedtest(
+                server_id=params.get("speed_server_id"),
+                timeout=float(params.get("speed_timeout") or 180.0),
+            )
+        except Exception as exc:
+            speed_stats = {"error": str(exc)}
     return ping_stats, speed_stats
 
 
@@ -206,8 +246,10 @@ def format_stats(device, round_no, ping_stats, speed_stats):
     elif speed_stats.get("error"):
         speed_text = f"speed error: {speed_stats['error']}"
     else:
-        speed_text = "down {:6.1f} / up {:6.1f} Mbit/s".format(
-            speed_stats.get("down_mbps") or 0.0, speed_stats.get("up_mbps") or 0.0
+        speed_text = "down {:6.1f} / up {:6.1f} Mbit/s  [{}]".format(
+            speed_stats.get("down_mbps") or 0.0,
+            speed_stats.get("up_mbps") or 0.0,
+            speed_stats.get("speed_server", "?"),
         )
     return "[round {}] {:>16}  ping {}  loss {}  {}".format(
         round_no, device, ping_text, loss_text, speed_text
@@ -217,6 +259,11 @@ def format_stats(device, round_no, ping_stats, speed_stats):
 
 def run_master(args):
     """Entry point for ``python -m wifi_test master``."""
+    if getattr(args, "list_servers", False):
+        print(speed_module.list_servers())
+        return 0
+
+    master_can_speed = speed_module.can_run()
     server = MasterServer(args.bind, args.port)
     server.start()
     store = ResultsStore(args.results)
@@ -240,6 +287,17 @@ def run_master(args):
     print(f"  ping target      : {args.ping_target} ({args.ping_count} probes, "
           f"{args.ping_method})")
     print(f"  speed test       : {'every round' if args.speed else 'disabled'}")
+    if args.speed:
+        if not master_can_speed:
+            print("  speedtest binary : WARNING - Ookla 'speedtest' not found on this "
+                  "master's PATH")
+        else:
+            print(f"  speedtest binary : {speed_module.find_binary()}")
+        print(f"  speed stagger    : {args.speed_stagger:g}s per device")
+        estimate = (args.ping_count * args.ping_timeout_ms / 1000.0) + 40.0
+        print(f"  round estimate   : ~{estimate:g}s + {args.speed_stagger:g}s per "
+              "extra device (Ookla tests usually take 30-40s; keep --interval above "
+              "this)")
     print(f"  results file     : {os.path.abspath(args.results)}")
     if plotter is not None:
         print(f"  graph file       : {os.path.abspath(args.graph)}")
@@ -254,6 +312,8 @@ def run_master(args):
         "ping_method": args.ping_method,
         "tcp_port": args.tcp_port,
         "speed": args.speed,
+        "speed_timeout": args.speed_timeout,
+        "speed_server_id": args.speed_server_id,
     }
 
     history = {}
@@ -292,18 +352,46 @@ def run_master(args):
 
 
 
+def round_budget(args, device_count, speed_enabled):
+    """How long a round may take, allowing for the staggered speed tests."""
+    ping_budget = args.ping_count * (args.ping_timeout_ms / 1000.0) + 5.0
+    if not speed_enabled:
+        return max(args.round_timeout, ping_budget + 10.0)
+    stagger_total = max(0, device_count - 1) * args.speed_stagger
+    return max(
+        args.round_timeout,
+        ping_budget + stagger_total + args.speed_timeout + 20.0,
+    )
+
+
 def run_round(server, store, history, plotter, params, local_name, round_no, args):
-    """Broadcast one round, measure locally, collect results, refresh the graph."""
+    """Command one round, measure locally, collect the results, refresh the graph."""
     params_round = dict(params)
     params_round["speed"] = args.speed and (
         args.speed_every <= 1 or round_no % args.speed_every == 1
     )
-    slaves = server.connected_devices()
-    expected = len(slaves) + 1  # the master also measures itself
+    capabilities = server.clients_snapshot()
+    slaves = sorted(capabilities)
+    devices = sorted(set(slaves) | {local_name})
+    # Deterministic stagger slots so the speed tests do not overlap.
+    slots = {name: index for index, name in enumerate(devices)}
+
     print(f"\n[master] round {round_no} starting ({len(slaves)} slave(s) connected)")
-    server.broadcast(
-        {"type": protocol.MSG_RUN, "round": round_no, "params": params_round}
-    )
+    no_speed = []
+    for name in slaves:
+        device_params = dict(params_round)
+        if capabilities.get(name) is False:
+            device_params["speed"] = False
+            no_speed.append(name)
+        device_params["speed_delay"] = slots[name] * args.speed_stagger
+        if not server.send_to(
+            name, {"type": protocol.MSG_RUN, "round": round_no, "params": device_params}
+        ):
+            print(f"[master] could not send the round to {name}")
+    if no_speed:
+        print("[master] speed tests skipped for {} (no Ookla speedtest on PATH)".format(
+            ", ".join(no_speed)
+        ))
 
     def record(device, result):
         stats = result.get("stats") or {}
@@ -314,8 +402,11 @@ def run_round(server, store, history, plotter, params, local_name, round_no, arg
         history.setdefault(device, []).append(row)
         store.append(row)
 
+    local_params = dict(params_round)
+    local_params["speed_delay"] = slots[local_name] * args.speed_stagger
+
     def measure_local():
-        ping_stats, speed_stats = measure_once(params_round)
+        ping_stats, speed_stats = measure_once(local_params)
         print(format_stats(local_name, round_no, ping_stats, speed_stats))
         ping_row = records.ping_row(round_no, local_name, "master", ping_stats)
         history.setdefault(local_name, []).append(ping_row)
@@ -327,9 +418,8 @@ def run_round(server, store, history, plotter, params, local_name, round_no, arg
         server.submit("done", local_name, round_no)
 
     threading.Thread(target=measure_local, daemon=True).start()
-    deadline = time.time() + args.round_timeout
-    done = server.wait_for(expected, deadline, record)
-    missing = set(slaves) - done
+    deadline = time.time() + round_budget(args, len(devices), params_round["speed"])
+    missing = server.wait_for(set(devices), deadline, record)
     if missing:
         print(f"[master] round {round_no}: no reply from {', '.join(sorted(missing))}")
     if plotter is not None:

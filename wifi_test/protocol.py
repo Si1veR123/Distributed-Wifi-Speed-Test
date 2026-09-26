@@ -34,6 +34,9 @@ class LineReader:
         while b"\n" not in self._buffer:
             try:
                 chunk = self._sock.recv(4096)
+            except socket.timeout:
+                # A read timeout only means "no data yet"; keep waiting.
+                continue
             except OSError:
                 return None
             if not chunk:

@@ -67,13 +67,38 @@ def build_parser():
     master.add_argument(
         "--speed",
         action="store_true",
-        help="run a speedtest each round (about 30s per test)",
+        help="run an Ookla speed test each round (about 30s per test)",
     )
     master.add_argument(
         "--speed-every",
         type=int,
         default=1,
         help="run the speedtest on every Nth round (default: %(default)s)",
+    )
+    master.add_argument(
+        "--speed-stagger",
+        type=float,
+        default=15.0,
+        help="seconds between each device's speed test within a round "
+        "(default: %(default)s)",
+    )
+    master.add_argument(
+        "--speed-timeout",
+        type=float,
+        default=180.0,
+        help="seconds before a speed test is abandoned (default: %(default)s)",
+    )
+    master.add_argument(
+        "--speed-server-id",
+        type=int,
+        default=None,
+        help="pin a specific Ookla server id for comparable results "
+        "(see --list-servers)",
+    )
+    master.add_argument(
+        "--list-servers",
+        action="store_true",
+        help="print the Ookla server list for this machine and exit",
     )
     master.add_argument(
         "--round-timeout",

@@ -7,6 +7,7 @@ import time
 
 from . import protocol
 from . import records
+from . import speed as speed_module
 from .master import measure_once
 
 
@@ -30,6 +31,7 @@ def _send_stats(sock, round_no, device, kind, stats):
 
 
 def _run_round(sock, round_no, device, params):
+    delay = float(params.get("speed_delay") or 0.0)
     print(f"[slave] round {round_no} starting ...")
     ping_stats, speed_stats = measure_once(params)
     _send_stats(sock, round_no, device, "ping", ping_stats)
@@ -48,9 +50,11 @@ def _run_round(sock, round_no, device, params):
             print(f"[slave] speed failed: {speed_stats['error']}")
         else:
             print(
-                "[slave] down {:6.1f} / up {:6.1f} Mbit/s".format(
+                "[slave] down {:6.1f} / up {:6.1f} Mbit/s  [{}]{}".format(
                     speed_stats.get("down_mbps") or 0.0,
                     speed_stats.get("up_mbps") or 0.0,
+                    speed_stats.get("speed_server", "?"),
+                    "" if delay <= 0 else f" delay {delay:g}s",
                 )
             )
     protocol.send_message(
@@ -59,7 +63,14 @@ def _run_round(sock, round_no, device, params):
 
 
 def _session(sock, device):
-    protocol.send_message(sock, {"type": protocol.MSG_HELLO, "device": device})
+    protocol.send_message(
+        sock,
+        {
+            "type": protocol.MSG_HELLO,
+            "device": device,
+            "speedtest": speed_module.can_run(),
+        },
+    )
     reader = protocol.LineReader(sock)
     while True:
         message = reader.read_message()
@@ -89,6 +100,14 @@ def run_slave(args):
     print("Distributed Wi-Fi diagnostics - SLAVE")
     print(f"  device name : {device}")
     print(f"  master      : {master_ip}:{args.port}")
+    flavour = speed_module.detect_flavour()
+    if flavour == "ookla":
+        print(f"  speedtest   : Ookla CLI at {speed_module.find_binary()}")
+    elif flavour is None:
+        print("  speedtest   : NOT FOUND on PATH (speed tests will be skipped)")
+    else:
+        print(f"  speedtest   : '{speed_module.find_binary()}' is {flavour}, not the "
+              "Ookla CLI (speed tests will be skipped)")
     print("  Press Ctrl+C to stop.")
     print("=" * 72)
 
@@ -105,6 +124,10 @@ def run_slave(args):
                 continue
 
             print(f"[slave] connected to {master_ip}:{args.port}")
+            # The connect timeout must not leak into the blocking reads that
+            # wait for the next round, otherwise idle periods look like a
+            # closed connection and the slave reconnects every round.
+            sock.settimeout(None)
             stopped_by_master = False
             try:
                 stopped_by_master = _session(sock, device)
