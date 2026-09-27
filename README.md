@@ -67,6 +67,12 @@ python -m wifi_test master --interval 60 --speed
 * `--speed-server-id 12345`  pin one server for comparable results (find an id
                     with `--list-servers`).
 * `--speed-timeout 180`  seconds before a speed test is abandoned.
+* `--speed-devices 1`  how many devices run a speed test per round. Tests are
+                    **rotated** between devices, because every device behind the
+                    router shares one rate limit for your public IP.
+* `--speed-cooldown 30`  minutes to pause speed tests after Ookla answers HTTP
+                    429 ("Too many requests received"); tests resume by
+                    themselves afterwards.
 * `--speed-every 5`  only run the speed test every Nth round.
 * `--duration 30`   stop automatically after 30 minutes (0 = run until Ctrl+C).
 * `--results-dir results`  where the per-session files are written.
@@ -163,6 +169,9 @@ per device (and per target for the probe panels).
   selection — which showed up as absurd `speed_latency_ms` values (e.g.
   `1800000`) and speeds far below a solo `speedtest`. Keep `--interval` above
   the round estimate the master prints at startup.
+* Ookla limits how often **one public IP** may run tests, and every device behind
+  your router shares that limit. That is why only `--speed-devices` devices test
+  per round (rotated) and why `--list-servers` / `check` also count towards it.
 * If ICMP is filtered on the WAN, add `--ping-method tcp` on the master; the
   setting is passed to the slaves.
 * The graph is drawn by the master only; slaves need neither matplotlib nor the
@@ -172,6 +181,13 @@ per device (and per target for the probe panels).
 
 * **`check` says the binary is `python-speedtest-cli`** — uninstall the Python
   `speedtest-cli` (or reorder `PATH`) and install the Ookla CLI.
+* **`429` / "Too many requests received"** — your public IP is rate limited by
+  Ookla; it is shared by every device behind the router. The master detects it,
+  prints the hint once and pauses speed tests for `--speed-cooldown` minutes. To
+  hit the limit less often: only one device per round
+  (`--speed-devices 1`, the default), a bigger `--interval`, `--speed-every`, and
+  avoid repeated `--list-servers`/`check` runs. Try `--speed-every 3` with
+  `--interval 180` for roughly one test per device per 9 minutes.
 * **`ConfigurationError` on one device** — its Ookla config directory is not
   writable; `python -m wifi_test check` prints the path and the problem.
 * **Every device spikes at the same moment** — look at the gateway and DNS rows

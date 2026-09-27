@@ -48,6 +48,45 @@ class ResultsStore:
         return self._row_count
 
 
+class SpeedPolicy:
+    """Decide which devices run a speed test, and back off when rate limited.
+
+    Ookla limits how often one **public IP** may run tests (HTTP 429 "Too many
+    requests received"), and every device behind the router shares that limit.
+    Tests are therefore rotated between devices instead of running on all of
+    them every round, and are paused for a cooldown after a 429.
+    """
+
+    def __init__(self, args):
+        self.devices_per_round = max(1, args.speed_devices)
+        self.cooldown_minutes = max(0.0, args.speed_cooldown)
+        self.cooldown_until = 0.0
+        self.limit_hits = 0
+
+    def paused_for(self):
+        """Seconds until speed tests may resume (0 when they are allowed)."""
+        return max(0.0, self.cooldown_until - time.time())
+
+    def selection(self, devices, round_no):
+        """Names from *devices* that should run the speed test this round."""
+        if not devices:
+            return set()
+        if self.devices_per_round >= len(devices):
+            return set(devices)
+        start = ((max(1, round_no) - 1) * self.devices_per_round) % len(devices)
+        return {devices[(start + index) % len(devices)]
+                for index in range(self.devices_per_round)}
+
+    def note_error(self, message):
+        """Register an error message; True if it starts a new rate-limit episode."""
+        if not speed_module.is_rate_limited(message):
+            return False
+        fresh = self.paused_for() <= 0
+        self.limit_hits += 1
+        self.cooldown_until = time.time() + self.cooldown_minutes * 60.0
+        return fresh
+
+
 class _Client:
     def __init__(self, sock, address):
         self.sock = sock
@@ -262,6 +301,7 @@ def run_master(args):
     master_can_speed = speed_module.can_run()
     session = time.strftime("%Y%m%d-%H%M%S")
     results_path, graph_path = resolve_paths(args, session)
+    policy = SpeedPolicy(args)
     server = MasterServer(args.bind, args.port)
     server.start()
     store = ResultsStore(results_path)
@@ -307,6 +347,8 @@ def run_master(args):
         else:
             print(f"  speedtest binary : {speed_module.find_binary()}")
         print(f"  speed stagger    : {args.speed_stagger:g}s per device")
+        print(f"  speed devices    : {args.speed_devices} per round, rotated between "
+              f"devices; {args.speed_cooldown:g} min pause after a rate limit")
     print(f"  results file     : {os.path.abspath(results_path)}")
     if plotter is not None:
         print(f"  graph file       : {os.path.abspath(graph_path)}")
@@ -342,7 +384,7 @@ def run_master(args):
             round_start = time.time()
             next_round_at = round_start + args.interval
             run_round(server, store, history, plotter, params, session,
-                      local_name, round_no, args)
+                      local_name, round_no, args, policy)
     except KeyboardInterrupt:
         print("\n[master] interrupted by user")
     finally:
@@ -375,7 +417,7 @@ def round_budget(args, device_count, speed_enabled, target_count):
 
 
 def run_round(server, store, history, plotter, params, session, local_name,
-              round_no, args):
+              round_no, args, policy):
     """Command one round, measure locally, collect the results, refresh the graph."""
     round_params = measure_module.for_round(params, round_no)
     round_params["speed"] = args.speed and (
@@ -387,13 +429,26 @@ def run_round(server, store, history, plotter, params, session, local_name,
     # Deterministic stagger slots so the speed tests do not overlap.
     slots = {name: index for index, name in enumerate(devices)}
 
+    paused = policy.paused_for()
+    if round_params["speed"] and paused > 0:
+        round_params["speed"] = False
+        print("[master] speed tests paused for another {:.0f}s "
+              "(Ookla rate limit; {} hit(s) so far)".format(paused, policy.limit_hits))
+
+    capable = [name for name in devices if capabilities.get(name) is not False]
+    selected = policy.selection(capable, round_no) if round_params["speed"] else set()
+    round_params["speed"] = False  # enabled per device below
+
     print(f"\n[master] round {round_no} starting ({len(slaves)} slave(s) connected)")
+    if selected:
+        print("[master] speed test this round: " + ", ".join(sorted(selected)))
     no_speed = []
     for name in slaves:
         device_params = dict(round_params)
         if capabilities.get(name) is False:
-            device_params["speed"] = False
             no_speed.append(name)
+        else:
+            device_params["speed"] = name in selected
         device_params["speed_delay"] = slots[name] * args.speed_stagger
         if not server.send_to(
             name, {"type": protocol.MSG_RUN, "round": round_no, "params": device_params}
@@ -404,16 +459,24 @@ def run_round(server, store, history, plotter, params, session, local_name,
             ", ".join(no_speed)
         ))
 
+    def note_rate_limit(stats):
+        message = (stats or {}).get("error")
+        if message and policy.note_error(message):
+            print("[master] " + speed_module.RATE_LIMIT_HINT)
+
     def record(device, message):
+        stats = message.get("stats") or {}
         row = records.row_from_result(
             session, message.get("round") or round_no, device, "slave", message
         )
         history.setdefault(device, []).append(row)
         store.append(row)
-        print(format_measurement(device, row["round"], row["kind"],
-                                 message.get("stats") or {}))
+        print(format_measurement(device, row["round"], row["kind"], stats))
+        if row["kind"] == "speed":
+            note_rate_limit(stats)
 
     local_params = dict(round_params)
+    local_params["speed"] = local_name in selected
     local_params["speed_delay"] = slots[local_name] * args.speed_stagger
 
     def measure_local():
@@ -424,11 +487,13 @@ def run_round(server, store, history, plotter, params, session, local_name,
             history.setdefault(local_name, []).append(row)
             store.append(row)
             print(format_measurement(local_name, round_no, kind, stats))
+            if kind == "speed":
+                note_rate_limit(stats)
         server.submit("done", local_name, round_no)
 
     threading.Thread(target=measure_local, daemon=True).start()
     deadline = time.time() + round_budget(
-        args, len(devices), round_params["speed"],
+        args, len(devices), bool(selected),
         len(round_params.get("ping_targets") or []),
     )
     missing = server.wait_for(set(devices), deadline, record)

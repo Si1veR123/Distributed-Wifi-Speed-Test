@@ -128,6 +128,21 @@ def build_parser():
         help="seconds before a speed test is abandoned (default: %(default)s)",
     )
     master.add_argument(
+        "--speed-devices",
+        type=int,
+        default=1,
+        help="how many devices run a speed test per round; tests are rotated "
+        "between devices so the shared public IP is not over-tested "
+        "(default: %(default)s)",
+    )
+    master.add_argument(
+        "--speed-cooldown",
+        type=float,
+        default=30.0,
+        help="minutes to pause speed tests after Ookla rate limits this public IP "
+        "(HTTP 429) (default: %(default)s)",
+    )
+    master.add_argument(
         "--speed-server-id",
         type=int,
         default=None,

@@ -23,9 +23,24 @@ INSTALL_HINT = (
     "binary also called 'speedtest' at /usr/bin/speedtest."
 )
 
+RATE_LIMIT_HINT = (
+    "Ookla is rate limiting this public IP (HTTP 429 'Too many requests'). "
+    "Every device shares that limit, so lower the speed-test frequency: "
+    "raise --interval, use --speed-every N, keep --speed-devices at 1 (tests are "
+    "then rotated between devices), and avoid running --list-servers/check in a "
+    "loop. Pinning a server with --speed-server-id also cuts API calls. "
+    "Speed tests resume automatically after --speed-cooldown minutes."
+)
+
 
 class SpeedtestError(RuntimeError):
     """Raised when the Ookla speedtest cannot be run or parsed."""
+
+
+def is_rate_limited(message):
+    """True when *message* looks like Ookla's HTTP 429 rate limit."""
+    text = (message or "").lower()
+    return "too many requests" in text or "429" in text
 
 
 def find_binary():
@@ -33,15 +48,21 @@ def find_binary():
     return shutil.which("speedtest") or shutil.which("speedtest.exe")
 
 
+_FLAVOUR_CACHE = {}
+
+
 def detect_flavour():
     """Report what the ``speedtest`` on PATH actually is.
 
     Returns ``"ookla"``, ``"python-speedtest-cli"``, ``"unknown"`` or ``None``
-    when no binary is present.
+    when no binary is present. The result is cached per binary path so a round
+    does not spawn an extra process per test.
     """
     binary = find_binary()
     if binary is None:
         return None
+    if binary in _FLAVOUR_CACHE:
+        return _FLAVOUR_CACHE[binary]
     try:
         completed = subprocess.run(
             [binary, "--version"], capture_output=True, text=True, timeout=20
@@ -50,10 +71,13 @@ def detect_flavour():
         return None
     text = ((completed.stdout or "") + (completed.stderr or "")).lower()
     if "ookla" in text:
-        return "ookla"
-    if "speedtest-cli" in text or "matt martz" in text:
-        return "python-speedtest-cli"
-    return "unknown"
+        flavour = "ookla"
+    elif "speedtest-cli" in text or "matt martz" in text:
+        flavour = "python-speedtest-cli"
+    else:
+        flavour = "unknown"
+    _FLAVOUR_CACHE[binary] = flavour
+    return flavour
 
 
 def can_run():
@@ -154,7 +178,10 @@ def _failure_detail(completed, messages):
         detail = messages[-1]
     if not detail:
         detail = "no output"
-    return "speedtest exited with code {}: {}".format(completed.returncode, detail)
+    text = "speedtest exited with code {}: {}".format(completed.returncode, detail)
+    if is_rate_limited(text):
+        text += "  |  " + RATE_LIMIT_HINT
+    return text
 
 
 def _stats_from_json(data, elapsed):
