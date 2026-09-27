@@ -80,6 +80,9 @@ python -m wifi_test master --interval 60 --speed
                     session-stamped defaults.
 * `--show`          also open a live graph window.
 * `--no-graphs`     skip graphs entirely.
+* `--graph-columns 3`  how many columns of panels the graph uses (0 = automatic:
+                    3 columns for the 12 panels, i.e. a 1680x1080 image). Use 2
+                    for a taller/narrower sheet or 4 for a wide one.
 * `--list-servers`  print the Ookla server list for this machine and exit.
 
 The master prints its session id, listening address, every probe target and the

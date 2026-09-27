@@ -319,7 +319,8 @@ def run_master(args):
         try:
             from .liveplot import LivePlotter
 
-            plotter = LivePlotter(graph_path, show=args.show)
+            plotter = LivePlotter(graph_path, show=args.show,
+                                  columns=args.graph_columns)
         except Exception as exc:
             print(f"[master] graphs disabled ({exc}); results are still recorded")
 

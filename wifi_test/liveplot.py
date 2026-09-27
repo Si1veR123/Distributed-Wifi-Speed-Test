@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
+import datetime
 import os
+import warnings
 
 
 GRAPH_ACCENTS = (
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#17becf",
+    # a second row of distinct colours: dense panels can plot one line per
+    # (device, probe target), which is more than the first eight cover.
+    "#393b79", "#637939", "#8c6d31", "#843c39",
+    "#7b4173", "#3182bd", "#31a354", "#756bb1",
 )
+
+# Figure geometry. Panels are kept reasonably square and the whole figure is
+# laid out by matplotlib's constrained_layout engine, which recomputes the
+# margins on every draw - important because a --show window may be resized by
+# the window manager (e.g. on a Raspberry Pi with a small screen), where
+# tight_layout would give up with "cannot make axes height small enough".
+PANEL_WIDTH = 5.6
+PANEL_HEIGHT = 2.7
+MAX_LEGEND_SERIES = 20
+
+
+def _clock_label(value, _position=None):
+    """X-axis label: local wall-clock time of the measurement."""
+    try:
+        return datetime.datetime.fromtimestamp(float(value)).strftime("%H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
 
 # (result-file column, panel title, y-axis unit, row filter)
 GRAPH_SERIES = (
@@ -90,27 +114,40 @@ def load_pyplot(interactive: bool):
 class LivePlotter:
     """Redraws one figure with a panel per metric, one line per device."""
 
-    def __init__(self, output_path, show=False, title="Distributed Wi-Fi diagnostics"):
+    def __init__(self, output_path, show=False,
+                 title="Distributed Wi-Fi diagnostics", columns=0):
         self.output_path = output_path
         self.show = show
         self.title = title
+        self.columns = max(0, int(columns or 0))
         self._plt = load_pyplot(interactive=show)
         self._fig = None
         self._axes = None
+        self._constrained = True
 
     def update(self, history):
         """Redraw from *history* (``device -> list of result rows``)."""
         plt = self._plt
+        from matplotlib.ticker import FuncFormatter, MaxNLocator
+
         count = len(GRAPH_SERIES)
-        columns = 2 if count > 1 else 1
+        columns = self.columns or (2 if count <= 6 else 3)
         rows = (count + columns - 1) // columns
 
         if self._fig is None:
             if self.show:
                 plt.ion()
-            self._fig, axes = plt.subplots(
-                rows, columns, figsize=(6.0 * columns, 2.6 * rows), squeeze=False
-            )
+            size = (PANEL_WIDTH * columns, PANEL_HEIGHT * rows)
+            try:
+                self._fig, axes = plt.subplots(
+                    rows, columns, figsize=size, squeeze=False,
+                    constrained_layout=True,
+                )
+            except TypeError:  # pragma: no cover - very old matplotlib
+                self._constrained = False
+                self._fig, axes = plt.subplots(
+                    rows, columns, figsize=size, squeeze=False
+                )
             self._axes = [axes[r][c] for r in range(rows) for c in range(columns)]
             if self.show:
                 try:
@@ -121,10 +158,13 @@ class LivePlotter:
         for index, (column, title, unit, flt) in enumerate(GRAPH_SERIES):
             axis = self._axes[index]
             axis.clear()
-            axis.set_title(title, fontsize=10)
-            axis.set_ylabel(unit, fontsize=8)
+            axis.set_title(title, fontsize=9)
+            axis.set_ylabel(unit, fontsize=7)
             axis.grid(True, alpha=0.3)
-            axis.tick_params(axis="x", labelrotation=30, labelsize=7)
+            axis.tick_params(axis="both", labelsize=6)
+            axis.tick_params(axis="x", labelrotation=20)
+            axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
+            axis.xaxis.set_major_formatter(FuncFormatter(_clock_label))
             if unit == "%":
                 axis.set_ylim(0, 100)
 
@@ -139,20 +179,40 @@ class LivePlotter:
                     values,
                     marker=".",
                     linewidth=1.0,
-                    markersize=4,
+                    markersize=3,
                     color=GRAPH_ACCENTS[plotted % len(GRAPH_ACCENTS)],
                     label=label,
                 )
                 plotted += 1
 
-            if plotted:
-                axis.legend(loc="best", fontsize=7)
+            if 0 < plotted <= MAX_LEGEND_SERIES:
+                dense = plotted > 6
+                axis.legend(
+                    loc="best",
+                    fontsize=5 if dense else 6,
+                    ncol=2 if dense else 1,
+                    framealpha=0.8,
+                    handlelength=1.2,
+                    borderpad=0.3,
+                    labelspacing=0.3,
+                    columnspacing=0.8,
+                )
 
         for index in range(count, len(self._axes)):
             self._axes[index].clear()
 
         self._fig.suptitle(self.title, fontsize=11)
-        self._fig.tight_layout(rect=(0, 0, 1, 0.97))
+        if not self._constrained:
+            # constrained_layout already handles the spacing (and keeps working
+            # when a --show window is resized); only old matplotlib builds need
+            # this manual pass, which can complain once the window is smaller
+            # than the axes decorations.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                try:
+                    self._fig.tight_layout(rect=(0, 0, 1, 0.98))
+                except Exception:
+                    pass
         self._save()
         if self.show:
             try:

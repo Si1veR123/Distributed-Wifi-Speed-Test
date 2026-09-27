@@ -178,6 +178,13 @@ def build_parser():
         help="explicit graph image path (default: next to the results file)",
     )
     master.add_argument(
+        "--graph-columns",
+        type=int,
+        default=0,
+        help="columns of panels in the graph image (0 = pick automatically; "
+        "default: %(default)s)",
+    )
+    master.add_argument(
         "--show", action="store_true", help="open a live graph window"
     )
     master.add_argument(
