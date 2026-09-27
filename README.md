@@ -184,6 +184,12 @@ per device (and per target for the probe panels).
 
 * **`check` says the binary is `python-speedtest-cli`** — uninstall the Python
   `speedtest-cli` (or reorder `PATH`) and install the Ookla CLI.
+* **A speed test reports a tiny download but no `speed_result_url`** — the run
+  aborted and the number is not a measurement (a healthy gigabit line can look
+  like "4 Mbit/s"). Newer builds set
+  `error = incomplete result from speedtest (no idle latency, upload, server,
+  result url)`; filter on `error` (or on an empty `speed_result_url`) before
+  analysing speeds in older files.
 * **`429` / "Too many requests received"** — your public IP is rate limited by
   Ookla; it is shared by every device behind the router. The master detects it,
   prints the hint once and pauses speed tests for `--speed-cooldown` minutes. To

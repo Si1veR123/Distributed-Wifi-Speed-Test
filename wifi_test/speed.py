@@ -196,6 +196,8 @@ def _stats_from_json(data, elapsed):
     location = server.get("location") or ""
     label = "{} ({})".format(name, location) if location else name
 
+    missing = _missing_result_parts(data)
+
     return {
         # Ookla reports bandwidth in bytes/second -> Mbit/s.
         "down_mbps": _to_mbps(download.get("bandwidth")),
@@ -222,8 +224,33 @@ def _stats_from_json(data, elapsed):
         "speed_vpn": interface.get("isVpn"),
         "speed_duration_s": round(elapsed, 1),
         "speed_result_url": result.get("url") or "",
-        "error": None,
+        "error": ("incomplete result from speedtest (no {})".format(
+            ", ".join(missing)) if missing else None),
     }
+
+
+def _missing_result_parts(data):
+    """Name the fields an aborted run leaves out.
+
+    A test that cannot reach a server, or that dies mid-run, still prints a
+    ``result`` object - with a truncated download figure but no ping/upload/
+    server details and no result URL. Reporting those as a real speed is how a
+    perfectly healthy gigabit line looks like "4 Mbit/s".
+    """
+    ping = data.get("ping") or {}
+    upload = data.get("upload") or {}
+    server = data.get("server") or {}
+    result = data.get("result") or {}
+    missing = []
+    if not ping.get("latency"):
+        missing.append("idle latency")
+    if not upload.get("bandwidth"):
+        missing.append("upload")
+    if not server.get("name"):
+        missing.append("server")
+    if not result.get("url"):
+        missing.append("result url")
+    return missing
 
 
 def _latency(phase, key):
