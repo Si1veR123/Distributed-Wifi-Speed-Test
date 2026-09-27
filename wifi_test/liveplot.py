@@ -10,14 +10,62 @@ GRAPH_ACCENTS = (
     "#9467bd", "#8c564b", "#e377c2", "#17becf",
 )
 
-# (result-file column, axis title, y-axis unit)
+# (result-file column, panel title, y-axis unit, row filter)
 GRAPH_SERIES = (
-    ("ping_avg_ms", "Ping - average", "ms"),
-    ("ping_max_ms", "Ping - maximum", "ms"),
-    ("loss_pct", "Packet loss", "%"),
-    ("down_mbps", "Download speed", "Mbit/s"),
-    ("up_mbps", "Upload speed", "Mbit/s"),
+    ("ping_avg_ms", "Ping - gateway (average)", "ms",
+     {"kind": "ping", "target_kind": "gateway"}),
+    ("ping_avg_ms", "Ping - WAN (average)", "ms",
+     {"kind": "ping", "target_kind": "wan"}),
+    ("ping_max_ms", "Ping - WAN (worst probe)", "ms",
+     {"kind": "ping", "target_kind": "wan"}),
+    ("loss_pct", "Packet loss (probes)", "%", {"kind": ("ping", "dns")}),
+    ("ping_avg_ms", "DNS resolution", "ms", {"kind": "dns"}),
+    ("ping_avg_ms", "TCP connect", "ms", {"kind": "ping", "target_kind": "tcp"}),
+    ("speed_latency_ms", "Latency idle (speedtest)", "ms", {"kind": "speed"}),
+    ("down_latency_ms", "Latency under download", "ms", {"kind": "speed"}),
+    ("up_latency_ms", "Latency under upload", "ms", {"kind": "speed"}),
+    ("down_mbps", "Download speed", "Mbit/s", {"kind": "speed"}),
+    ("up_mbps", "Upload speed", "Mbit/s", {"kind": "speed"}),
+    ("speed_packet_loss", "Packet loss (speedtest)", "%", {"kind": "speed"}),
 )
+
+
+def _matches(row, flt):
+    for key, wanted in flt.items():
+        value = row.get(key)
+        if isinstance(wanted, (tuple, list, set)):
+            if value not in wanted:
+                return False
+        elif value != wanted:
+            return False
+    return True
+
+
+def _series_for_panel(history, column, flt, split_target):
+    """Group the rows of *history* into ``{label: ([x], [y])}``."""
+    series = {}
+    for device, rows in history.items():
+        for row in rows:
+            if not _matches(row, flt):
+                continue
+            value = row.get(column)
+            if value in (None, ""):
+                continue
+            try:
+                x = float(row.get("epoch") or 0.0)
+                y = float(value)
+            except (TypeError, ValueError):
+                continue
+            if split_target:
+                label = "{} @{}".format(
+                    device, row.get("target") or row.get("target_kind") or "?"
+                )
+            else:
+                label = device
+            times, values = series.setdefault(label, ([], []))
+            times.append(x)
+            values.append(y)
+    return series
 
 
 class GraphingUnavailable(RuntimeError):
@@ -70,8 +118,7 @@ class LivePlotter:
                 except Exception:
                     pass
 
-        devices = list(history.keys())
-        for index, (column, title, unit) in enumerate(GRAPH_SERIES):
+        for index, (column, title, unit, flt) in enumerate(GRAPH_SERIES):
             axis = self._axes[index]
             axis.clear()
             axis.set_title(title, fontsize=10)
@@ -81,30 +128,22 @@ class LivePlotter:
             if unit == "%":
                 axis.set_ylim(0, 100)
 
+            split_target = flt.get("kind") != "speed"
+            series = _series_for_panel(history, column, flt, split_target)
+
             plotted = 0
-            for device_index, device in enumerate(devices):
-                times = []
-                values = []
-                for row in history.get(device, []):
-                    value = row.get(column)
-                    if value in (None, ""):
-                        continue
-                    try:
-                        values.append(float(value))
-                        times.append(float(row.get("epoch") or 0.0))
-                    except (TypeError, ValueError):
-                        continue
-                if times:
-                    axis.plot(
-                        times,
-                        values,
-                        marker=".",
-                        linewidth=1.0,
-                        markersize=4,
-                        color=GRAPH_ACCENTS[device_index % len(GRAPH_ACCENTS)],
-                        label=device,
-                    )
-                    plotted += 1
+            for label in sorted(series):
+                times, values = series[label]
+                axis.plot(
+                    times,
+                    values,
+                    marker=".",
+                    linewidth=1.0,
+                    markersize=4,
+                    color=GRAPH_ACCENTS[plotted % len(GRAPH_ACCENTS)],
+                    label=label,
+                )
+                plotted += 1
 
             if plotted:
                 axis.legend(loc="best", fontsize=7)

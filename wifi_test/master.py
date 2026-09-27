@@ -9,10 +9,11 @@ import socket
 import threading
 import time
 
-from . import ping as ping_module
+from . import measure as measure_module
 from . import protocol
 from . import records
 from . import speed as speed_module
+from . import targets as targets_module
 
 
 class ResultsStore:
@@ -203,57 +204,52 @@ class MasterServer:
                     pass
 
 
-def measure_once(params):
-    """Run the ping and (optionally) speed measurement described by *params*."""
-    target = params["ping_target"]
-    count = params["ping_count"]
-    timeout_ms = params["ping_timeout_ms"]
-    if params.get("ping_method") == "tcp":
-        ping_stats = ping_module.ping_tcp(
-            target, params.get("tcp_port", 443), count=count, timeout_ms=timeout_ms
-        )
+def format_measurement(device, round_no, kind, stats):
+    """Format a single measurement as one console line."""
+    if kind == "speed":
+        label = "speed"
+        detail = measure_module.describe_speed(stats)
     else:
-        ping_stats = ping_module.ping_icmp(target, count=count, timeout_ms=timeout_ms)
-
-    speed_stats = None
-    if params.get("speed"):
-        # Stagger the speed tests so they do not corrupt each other or the
-        # speedtest server selection by all running at once.
-        delay = float(params.get("speed_delay") or 0.0)
-        if delay > 0:
-            time.sleep(delay)
-        try:
-            speed_stats = speed_module.run_speedtest(
-                server_id=params.get("speed_server_id"),
-                timeout=float(params.get("speed_timeout") or 180.0),
-            )
-        except Exception as exc:
-            speed_stats = {"error": str(exc)}
-    return ping_stats, speed_stats
-
-
-def format_stats(device, round_no, ping_stats, speed_stats):
-    if ping_stats.get("ping_avg_ms") is not None:
-        ping_text = "{:6.1f} ms".format(ping_stats["ping_avg_ms"])
-    else:
-        ping_text = "   n/a  "
-    if ping_stats.get("loss_pct") is None:
-        loss_text = "  n/a"
-    else:
-        loss_text = "{:5.1f}%".format(ping_stats["loss_pct"])
-    if speed_stats is None:
-        speed_text = "speed skipped"
-    elif speed_stats.get("error"):
-        speed_text = f"speed error: {speed_stats['error']}"
-    else:
-        speed_text = "down {:6.1f} / up {:6.1f} Mbit/s  [{}]".format(
-            speed_stats.get("down_mbps") or 0.0,
-            speed_stats.get("up_mbps") or 0.0,
-            speed_stats.get("speed_server", "?"),
-        )
-    return "[round {}] {:>16}  ping {}  loss {}  {}".format(
-        round_no, device, ping_text, loss_text, speed_text
+        label = "{} {}".format(stats.get("target_kind") or kind,
+                               stats.get("target") or "")
+        detail = measure_module.describe_latency(stats)
+    return "[round {:>3}] {:>16}  {:<26} {}".format(
+        round_no, device, label.strip()[:26], detail
     )
+
+
+def resolve_paths(args, session):
+    """Return ``(results_path, graph_path)`` for this session.
+
+    Every run gets its own pair of files, so round numbers can never collide
+    with an earlier run that was appended to the same file.
+    """
+    if args.results:
+        graph = args.graph or os.path.splitext(args.results)[0] + ".png"
+        return args.results, graph
+    return (os.path.join(args.results_dir, "session-{}.csv".format(session)),
+            os.path.join(args.results_dir, "session-{}.png".format(session)))
+
+
+def build_params(args, ping_targets, tcp_probe_target):
+    """Assemble the per-round settings that are handed to every device."""
+    return {
+        "ping_targets": [{"host": host, "kind": kind} for host, kind in ping_targets],
+        "ping_count": args.ping_count,
+        "ping_timeout_ms": args.ping_timeout_ms,
+        "ping_interval_ms": int(round(args.ping_interval * 1000)),
+        "ping_method": args.ping_method,
+        "tcp_port": args.tcp_port,
+        "dns_enabled": not args.no_dns,
+        "dns_count": args.dns_count,
+        "dns_timeout_s": args.dns_timeout,
+        "tcp_enabled": not args.no_tcp,
+        "tcp_probe_target": tcp_probe_target,
+        "tcp_count": args.tcp_count,
+        "speed": args.speed,
+        "speed_timeout": args.speed_timeout,
+        "speed_server_id": args.speed_server_id,
+    }
 
 
 
@@ -264,29 +260,46 @@ def run_master(args):
         return 0
 
     master_can_speed = speed_module.can_run()
+    session = time.strftime("%Y%m%d-%H%M%S")
+    results_path, graph_path = resolve_paths(args, session)
     server = MasterServer(args.bind, args.port)
     server.start()
-    store = ResultsStore(args.results)
+    store = ResultsStore(results_path)
 
     plotter = None
     if not args.no_graphs:
         try:
             from .liveplot import LivePlotter
 
-            plotter = LivePlotter(args.graph, show=args.show)
+            plotter = LivePlotter(graph_path, show=args.show)
         except Exception as exc:
             print(f"[master] graphs disabled ({exc}); results are still recorded")
+
+    ping_targets = (targets_module.parse_targets(args.ping_targets)
+                    or targets_module.default_ping_targets())
+    tcp_probe_target = (args.tcp_probe
+                        or next((host for host, kind in ping_targets if kind == "wan"),
+                                "1.1.1.1"))
+    params = build_params(args, ping_targets, tcp_probe_target)
 
     local_name = args.device or socket.gethostname()
     print("=" * 72)
     print("Distributed Wi-Fi diagnostics - MASTER")
+    print(f"  session          : {session}")
     print(f"  listening on     : {args.bind}:{server.bound_port}")
     print(f"  local device name: {local_name}")
     duration_text = "unlimited" if not args.duration else f"{args.duration:g} min"
     print(f"  interval         : {args.interval:g}s   duration: {duration_text}")
-    print(f"  ping target      : {args.ping_target} ({args.ping_count} probes, "
-          f"{args.ping_method})")
-    print(f"  speed test       : {'every round' if args.speed else 'disabled'}")
+    print("  ping targets     : " + ", ".join(
+        f"{host} [{kind}]" for host, kind in ping_targets))
+    print(f"  probes           : {args.ping_count} per target, {args.ping_method}, "
+          f"interval {args.ping_interval:g}s")
+    if not args.no_dns:
+        print(f"  dns probe        : {args.dns_count} fresh names per round "
+              f"(timeout {args.dns_timeout:g}s)")
+    if not args.no_tcp:
+        print(f"  tcp connect probe: {tcp_probe_target}:{args.tcp_port} "
+              f"x{args.tcp_count}")
     if args.speed:
         if not master_can_speed:
             print("  speedtest binary : WARNING - Ookla 'speedtest' not found on this "
@@ -294,27 +307,16 @@ def run_master(args):
         else:
             print(f"  speedtest binary : {speed_module.find_binary()}")
         print(f"  speed stagger    : {args.speed_stagger:g}s per device")
-        estimate = (args.ping_count * args.ping_timeout_ms / 1000.0) + 40.0
-        print(f"  round estimate   : ~{estimate:g}s + {args.speed_stagger:g}s per "
-              "extra device (Ookla tests usually take 30-40s; keep --interval above "
-              "this)")
-    print(f"  results file     : {os.path.abspath(args.results)}")
+    print(f"  results file     : {os.path.abspath(results_path)}")
     if plotter is not None:
-        print(f"  graph file       : {os.path.abspath(args.graph)}")
+        print(f"  graph file       : {os.path.abspath(graph_path)}")
+    print("  round estimate   : up to %gs with 4 devices (keep --interval above this)"
+          % round_budget(args, 4, args.speed, len(ping_targets)))
     print("  Run slaves with:  python -m wifi_test slave --master-ip <this-ip>")
     print("  Press Ctrl+C to stop.")
     print("=" * 72)
 
-    params = {
-        "ping_target": args.ping_target,
-        "ping_count": args.ping_count,
-        "ping_timeout_ms": args.ping_timeout_ms,
-        "ping_method": args.ping_method,
-        "tcp_port": args.tcp_port,
-        "speed": args.speed,
-        "speed_timeout": args.speed_timeout,
-        "speed_server_id": args.speed_server_id,
-    }
+    # (the per-round settings were built above as ``params``)
 
     history = {}
     stop_at = time.time() + args.duration * 60 if args.duration else None
@@ -339,35 +341,44 @@ def run_master(args):
             round_no += 1
             round_start = time.time()
             next_round_at = round_start + args.interval
-            run_round(server, store, history, plotter, params, local_name,
-                      round_no, args)
+            run_round(server, store, history, plotter, params, session,
+                      local_name, round_no, args)
     except KeyboardInterrupt:
         print("\n[master] interrupted by user")
     finally:
         server.stop()
         if plotter is not None:
             plotter.close()
-        print(f"[master] results written to {os.path.abspath(args.results)}")
+        print(f"[master] results written to {os.path.abspath(results_path)}")
     return 0
 
 
 
-def round_budget(args, device_count, speed_enabled):
-    """How long a round may take, allowing for the staggered speed tests."""
-    ping_budget = args.ping_count * (args.ping_timeout_ms / 1000.0) + 5.0
-    if not speed_enabled:
-        return max(args.round_timeout, ping_budget + 10.0)
-    stagger_total = max(0, device_count - 1) * args.speed_stagger
-    return max(
-        args.round_timeout,
-        ping_budget + stagger_total + args.speed_timeout + 20.0,
-    )
+def device_budget(args, target_count):
+    """Worst-case seconds one device needs to finish its own measurements."""
+    probe_span = max(1, target_count) * args.ping_count * max(1.0, args.ping_interval)
+    budget = probe_span + 10.0
+    if not args.no_dns:
+        budget += args.dns_count * args.dns_timeout + 2.0
+    if not args.no_tcp:
+        budget += args.tcp_count * (args.ping_timeout_ms / 1000.0 + 0.1) + 2.0
+    return budget
 
 
-def run_round(server, store, history, plotter, params, local_name, round_no, args):
+def round_budget(args, device_count, speed_enabled, target_count):
+    """Longest a round may take, allowing for the staggered speed tests."""
+    budget = device_budget(args, target_count)
+    if speed_enabled:
+        budget += args.speed_timeout
+        budget += max(0, device_count - 1) * args.speed_stagger
+    return max(args.round_timeout, budget)
+
+
+def run_round(server, store, history, plotter, params, session, local_name,
+              round_no, args):
     """Command one round, measure locally, collect the results, refresh the graph."""
-    params_round = dict(params)
-    params_round["speed"] = args.speed and (
+    round_params = measure_module.for_round(params, round_no)
+    round_params["speed"] = args.speed and (
         args.speed_every <= 1 or round_no % args.speed_every == 1
     )
     capabilities = server.clients_snapshot()
@@ -379,7 +390,7 @@ def run_round(server, store, history, plotter, params, local_name, round_no, arg
     print(f"\n[master] round {round_no} starting ({len(slaves)} slave(s) connected)")
     no_speed = []
     for name in slaves:
-        device_params = dict(params_round)
+        device_params = dict(round_params)
         if capabilities.get(name) is False:
             device_params["speed"] = False
             no_speed.append(name)
@@ -393,37 +404,38 @@ def run_round(server, store, history, plotter, params, local_name, round_no, arg
             ", ".join(no_speed)
         ))
 
-    def record(device, result):
-        stats = result.get("stats") or {}
-        if result.get("kind") == "speed":
-            row = records.speed_row(round_no, device, "slave", stats)
-        else:
-            row = records.ping_row(round_no, device, "slave", stats)
+    def record(device, message):
+        row = records.row_from_result(
+            session, message.get("round") or round_no, device, "slave", message
+        )
         history.setdefault(device, []).append(row)
         store.append(row)
+        print(format_measurement(device, row["round"], row["kind"],
+                                 message.get("stats") or {}))
 
-    local_params = dict(params_round)
+    local_params = dict(round_params)
     local_params["speed_delay"] = slots[local_name] * args.speed_stagger
 
     def measure_local():
-        ping_stats, speed_stats = measure_once(local_params)
-        print(format_stats(local_name, round_no, ping_stats, speed_stats))
-        ping_row = records.ping_row(round_no, local_name, "master", ping_stats)
-        history.setdefault(local_name, []).append(ping_row)
-        store.append(ping_row)
-        if speed_stats is not None:
-            speed_row = records.speed_row(round_no, local_name, "master", speed_stats)
-            history.setdefault(local_name, []).append(speed_row)
-            store.append(speed_row)
+        for kind, stats, context in measure_module.iter_measurements(local_params):
+            stamp, epoch = records.now_stamp()
+            row = records.row_for(session, round_no, local_name, "master", kind,
+                                  stats, context, stamp, epoch)
+            history.setdefault(local_name, []).append(row)
+            store.append(row)
+            print(format_measurement(local_name, round_no, kind, stats))
         server.submit("done", local_name, round_no)
 
     threading.Thread(target=measure_local, daemon=True).start()
-    deadline = time.time() + round_budget(args, len(devices), params_round["speed"])
+    deadline = time.time() + round_budget(
+        args, len(devices), round_params["speed"],
+        len(round_params.get("ping_targets") or []),
+    )
     missing = server.wait_for(set(devices), deadline, record)
     if missing:
         print(f"[master] round {round_no}: no reply from {', '.join(sorted(missing))}")
     if plotter is not None:
         plotter.update(history)
     print(f"[master] round {round_no} complete "
-          f"({store.row_count} rows in {args.results})")
+          f"({store.row_count} rows in {os.path.basename(store.path)})")
 

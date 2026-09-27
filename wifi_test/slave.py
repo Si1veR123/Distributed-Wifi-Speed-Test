@@ -5,16 +5,16 @@ from __future__ import annotations
 import socket
 import time
 
+from . import measure as measure_module
 from . import protocol
 from . import records
 from . import speed as speed_module
-from .master import measure_once
 
 
 RECONNECT_DELAY = 3.0
 
 
-def _send_stats(sock, round_no, device, kind, stats):
+def _send_result(sock, round_no, device, kind, stats, context):
     stamp, epoch = records.now_stamp()
     protocol.send_message(
         sock,
@@ -25,6 +25,7 @@ def _send_stats(sock, round_no, device, kind, stats):
             "kind": kind,
             "timestamp": stamp,
             "epoch": epoch,
+            "context": context,
             "stats": stats,
         },
     )
@@ -33,30 +34,17 @@ def _send_stats(sock, round_no, device, kind, stats):
 def _run_round(sock, round_no, device, params):
     delay = float(params.get("speed_delay") or 0.0)
     print(f"[slave] round {round_no} starting ...")
-    ping_stats, speed_stats = measure_once(params)
-    _send_stats(sock, round_no, device, "ping", ping_stats)
-    if ping_stats.get("ping_avg_ms") is not None:
-        print(
-            "[slave] ping {:6.1f} ms  loss {:5.1f}%".format(
-                ping_stats["ping_avg_ms"], ping_stats.get("loss_pct") or 0.0
-            )
-        )
-    else:
-        print(f"[slave] ping failed: {ping_stats.get('error') or 'no replies'}")
-
-    if speed_stats is not None:
-        _send_stats(sock, round_no, device, "speed", speed_stats)
-        if speed_stats.get("error"):
-            print(f"[slave] speed failed: {speed_stats['error']}")
+    for kind, stats, context in measure_module.iter_measurements(params):
+        _send_result(sock, round_no, device, kind, stats, context)
+        if kind == "speed":
+            suffix = "" if delay <= 0 else "  (delayed {:.0f}s)".format(delay)
+            print("[slave] speed    {} {}".format(
+                measure_module.describe_speed(stats), suffix))
         else:
-            print(
-                "[slave] down {:6.1f} / up {:6.1f} Mbit/s  [{}]{}".format(
-                    speed_stats.get("down_mbps") or 0.0,
-                    speed_stats.get("up_mbps") or 0.0,
-                    speed_stats.get("speed_server", "?"),
-                    "" if delay <= 0 else f" delay {delay:g}s",
-                )
-            )
+            print("[slave] {:<8} {:<16} {}".format(
+                stats.get("target_kind") or kind,
+                stats.get("target") or "",
+                measure_module.describe_latency(stats)))
     protocol.send_message(
         sock, {"type": protocol.MSG_ROUND_DONE, "round": round_no, "device": device}
     )
@@ -102,7 +90,15 @@ def run_slave(args):
     print(f"  master      : {master_ip}:{args.port}")
     flavour = speed_module.detect_flavour()
     if flavour == "ookla":
-        print(f"  speedtest   : Ookla CLI at {speed_module.find_binary()}")
+        state = speed_module.config_writable()
+        if state is False:
+            note = "  [config NOT writable - runs may fail with ConfigurationError]"
+        elif state is None:
+            note = "  [config not created yet]"
+        else:
+            note = ""
+        print(f"  speedtest   : Ookla CLI at {speed_module.find_binary()}{note}")
+        speed_module.accept_licence()
     elif flavour is None:
         print("  speedtest   : NOT FOUND on PATH (speed tests will be skipped)")
     else:

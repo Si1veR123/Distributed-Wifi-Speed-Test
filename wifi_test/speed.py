@@ -8,6 +8,7 @@ values are converted to Mbit/s here.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -78,7 +79,7 @@ def run_speedtest(server_id=None, timeout=180.0):
 
     command = [
         binary,
-        "--format=json",
+        "--format=jsonl",
         "--accept-license",
         "--accept-gdpr",
     ]
@@ -95,19 +96,65 @@ def run_speedtest(server_id=None, timeout=180.0):
     except OSError as exc:
         raise SpeedtestError("could not run '{}': {}".format(binary, exc))
 
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()
-        last_line = detail.splitlines()[-1] if detail else "no output"
-        raise SpeedtestError(
-            "speedtest exited with code {}: {}".format(completed.returncode, last_line)
-        )
+    elapsed = time.perf_counter() - started
+    result, messages = parse_output(completed.stdout or "")
+    if result is None:
+        raise SpeedtestError(_failure_detail(completed, messages))
 
-    try:
-        data = json.loads((completed.stdout or "").strip())
-    except ValueError as exc:
-        raise SpeedtestError("could not parse speedtest JSON: {}".format(exc))
+    stats = _stats_from_json(result, elapsed)
+    stats["speed_messages"] = messages
+    return stats
 
-    return _stats_from_json(data, time.perf_counter() - started)
+
+def parse_output(text):
+    """Parse CLI output into ``(result_object, [log messages])``.
+
+    The CLI emits newline-delimited JSON objects (``{"type":"log", ...}`` plus
+    one ``{"type":"result", ...}``). Older builds emit a single JSON document,
+    so fall back to parsing the whole output.
+    """
+    result = None
+    messages = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "result":
+            result = item
+        elif item_type == "log":
+            message = item.get("message")
+            if message:
+                messages.append(str(message))
+        elif result is None and "download" in item:
+            result = item
+    if result is None:
+        stripped = (text or "").strip()
+        if stripped.startswith("{"):
+            try:
+                item = json.loads(stripped)
+            except ValueError:
+                item = None
+            if isinstance(item, dict):
+                return item, messages
+    return result, messages
+
+
+def _failure_detail(completed, messages):
+    """Build a readable error message from a failed run."""
+    lines = [line for line in (completed.stderr or "").splitlines() if line.strip()]
+    detail = lines[-1].strip() if lines else ""
+    if not detail and messages:
+        detail = messages[-1]
+    if not detail:
+        detail = "no output"
+    return "speedtest exited with code {}: {}".format(completed.returncode, detail)
 
 
 def _stats_from_json(data, elapsed):
@@ -116,6 +163,7 @@ def _stats_from_json(data, elapsed):
     ping = data.get("ping") or {}
     server = data.get("server") or {}
     result = data.get("result") or {}
+    interface = data.get("interface") or {}
 
     name = server.get("name") or "?"
     location = server.get("location") or ""
@@ -125,14 +173,38 @@ def _stats_from_json(data, elapsed):
         # Ookla reports bandwidth in bytes/second -> Mbit/s.
         "down_mbps": _to_mbps(download.get("bandwidth")),
         "up_mbps": _to_mbps(upload.get("bandwidth")),
-        "speed_server": label,
-        "speed_server_id": server.get("id"),
+        # Idle latency, and what the test measured while it was loading the link
+        # (the "latency under load" figures - this is bufferbloat).
         "speed_latency_ms": ping.get("latency"),
         "speed_jitter_ms": ping.get("jitter"),
-        "speed_result_url": result.get("url"),
+        "speed_latency_low_ms": ping.get("low"),
+        "speed_latency_high_ms": ping.get("high"),
+        "down_latency_ms": _latency(download, "iqm"),
+        "down_latency_high_ms": _latency(download, "high"),
+        "down_latency_jitter_ms": _latency(download, "jitter"),
+        "up_latency_ms": _latency(upload, "iqm"),
+        "up_latency_high_ms": _latency(upload, "high"),
+        "up_latency_jitter_ms": _latency(upload, "jitter"),
+        "speed_packet_loss": data.get("packetLoss"),
+        "speed_server": label,
+        "speed_server_id": server.get("id"),
+        "speed_isp": data.get("isp") or "",
+        "speed_iface": interface.get("name") or "",
+        "speed_ip_internal": interface.get("internalIp") or "",
+        "speed_ip_external": interface.get("externalIp") or "",
+        "speed_vpn": interface.get("isVpn"),
         "speed_duration_s": round(elapsed, 1),
+        "speed_result_url": result.get("url") or "",
         "error": None,
     }
+
+
+def _latency(phase, key):
+    """Read one latency value out of a download/upload block."""
+    latency = phase.get("latency")
+    if isinstance(latency, dict):
+        return latency.get(key)
+    return None
 
 
 def _to_mbps(bytes_per_second):
@@ -153,4 +225,84 @@ def list_servers():
         timeout=60,
     )
     return (completed.stdout or "") + (completed.stderr or "")
+
+
+def config_dir():
+    """Where the Ookla CLI keeps its config/licence files."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "Ookla", "Speedtest")
+    return os.path.expanduser("~/.config/ookla")
+
+
+def check():
+    """Return a human-readable health report for the speedtest setup.
+
+    Also runs a short command that initialises the licence/config files, so a
+    ``ConfigurationError`` (non-writable config) shows up here.
+    """
+    binary = find_binary()
+    if binary is None:
+        return "speedtest : NOT FOUND on PATH. " + INSTALL_HINT
+
+    flavour = detect_flavour()
+    if flavour != "ookla":
+        return ("speedtest : '{}' is {} - not the Ookla CLI. {}"
+                .format(binary, flavour, INSTALL_HINT))
+
+    directory = config_dir()
+    if not os.path.isdir(directory):
+        state = "missing (a successful run will create it)"
+    elif os.access(directory, os.W_OK):
+        state = "present and writable"
+    else:
+        state = "present but NOT writable - runs will fail with ConfigurationError"
+
+    lines = [
+        "speedtest : {} (Ookla CLI)".format(binary),
+        "config    : {} - {}".format(directory, state),
+    ]
+    try:
+        completed = subprocess.run(
+            [binary, "--accept-license", "--accept-gdpr", "--format=jsonl", "--servers"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        lines.append("servers   : could not run: {}".format(exc))
+        return "\n".join(lines)
+
+    if completed.returncode == 0:
+        lines.append("servers   : OK (licence accepted, server list retrieved)")
+    else:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        lines.append("servers   : FAILED (exit {}) {}".format(
+            completed.returncode, detail[-1] if detail else "no output"))
+    return "\n".join(lines)
+
+
+def config_writable():
+    """``True``/``False`` if the config directory exists, ``None`` if not yet."""
+    directory = config_dir()
+    if not os.path.isdir(directory):
+        return None
+    return os.access(directory, os.W_OK)
+
+
+def accept_licence(timeout=20.0):
+    """Best effort: run the CLI once so the licence/GDPR files get written."""
+    binary = find_binary()
+    if binary is None or detect_flavour() != "ookla":
+        return False
+    try:
+        completed = subprocess.run(
+            [binary, "--accept-license", "--accept-gdpr", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
 

@@ -1,9 +1,10 @@
-"""Command line entry point: ``python -m wifi_test {master|slave|selftest}``."""
+"""Command line entry point: ``python -m wifi_test {master|slave|check}``."""
 
 from __future__ import annotations
 
 import argparse
 
+from . import speed as speed_module
 from .master import run_master
 from .slave import run_slave
 
@@ -13,33 +14,71 @@ DEFAULT_PORT = 50607
 
 def _add_measurement_options(parser):
     parser.add_argument(
-        "--ping-target",
-        default="1.1.1.1",
-        help="host to ping for latency/jitter/loss (default: %(default)s)",
+        "--ping-targets",
+        default=None,
+        help="comma-separated hosts to probe, optionally 'host:kind' where kind "
+        "is gateway/dns/wan (default: auto-detect the gateway, the DNS server, "
+        "1.1.1.1 and 8.8.8.8)",
     )
     parser.add_argument(
         "--ping-count",
         type=int,
         default=10,
-        help="number of pings per round (default: %(default)s)",
+        help="number of probes per target per round (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ping-interval",
+        type=float,
+        default=1.0,
+        help="seconds between probes where the OS supports it (default: %(default)s)",
     )
     parser.add_argument(
         "--ping-timeout-ms",
         type=int,
         default=1000,
-        help="per-ping timeout in ms (default: %(default)s)",
+        help="per-probe timeout in ms (default: %(default)s)",
     )
     parser.add_argument(
         "--ping-method",
         choices=("icmp", "tcp"),
         default="icmp",
-        help="latency probe type; use 'tcp' when ICMP is filtered (default: %(default)s)",
+        help="probe type for the WAN targets; use 'tcp' when ICMP is filtered "
+        "(default: %(default)s)",
     )
     parser.add_argument(
         "--tcp-port",
         type=int,
         default=443,
-        help="port used by --ping-method tcp (default: %(default)s)",
+        help="port used by TCP probes (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-dns", action="store_true", help="skip the DNS-resolution probe"
+    )
+    parser.add_argument(
+        "--dns-count",
+        type=int,
+        default=3,
+        help="hostnames to resolve per round (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--dns-timeout",
+        type=float,
+        default=5.0,
+        help="seconds allowed per DNS lookup (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-tcp", action="store_true", help="skip the TCP-connect probe"
+    )
+    parser.add_argument(
+        "--tcp-probe",
+        default=None,
+        help="host for the TCP-connect probe (default: the first WAN ping target)",
+    )
+    parser.add_argument(
+        "--tcp-count",
+        type=int,
+        default=5,
+        help="TCP-connect probes per round (default: %(default)s)",
     )
 
 
@@ -107,10 +146,21 @@ def build_parser():
         help="seconds to wait for all devices in a round (default: %(default)s)",
     )
     master.add_argument(
-        "--results", default="results.csv", help="results CSV path"
+        "--results-dir",
+        default="results",
+        help="directory for the per-session results and graph files "
+        "(default: %(default)s)",
     )
     master.add_argument(
-        "--graph", default="wifi_graphs.png", help="output graph image path"
+        "--results",
+        default=None,
+        help="explicit results CSV path (default: "
+        "<results-dir>/session-<timestamp>.csv)",
+    )
+    master.add_argument(
+        "--graph",
+        default=None,
+        help="explicit graph image path (default: next to the results file)",
     )
     master.add_argument(
         "--show", action="store_true", help="open a live graph window"
@@ -148,6 +198,12 @@ def build_parser():
         help="seconds to wait when connecting (default: %(default)s)",
     )
 
+    subparsers.add_parser(
+        "check",
+        help="report the Ookla speedtest setup on this device (binary, config, "
+        "licence) and exit",
+    )
+
     return parser
 
 
@@ -158,6 +214,9 @@ def main(argv=None):
         return run_master(args)
     if args.mode == "slave":
         return run_slave(args)
+    if args.mode == "check":
+        print(speed_module.check())
+        return 0
     parser.error(f"unknown mode: {args.mode}")
     return 2
 
