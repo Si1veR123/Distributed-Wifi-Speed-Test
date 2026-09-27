@@ -62,18 +62,26 @@ class SpeedPolicy:
         self.cooldown_minutes = max(0.0, args.speed_cooldown)
         self.cooldown_until = 0.0
         self.limit_hits = 0
+        self.rotation = 0
 
     def paused_for(self):
         """Seconds until speed tests may resume (0 when they are allowed)."""
         return max(0.0, self.cooldown_until - time.time())
 
-    def selection(self, devices, round_no):
-        """Names from *devices* that should run the speed test this round."""
+    def selection(self, devices):
+        """Names from *devices* that should run the speed test this time.
+
+        The rotation advances once per *speed round* rather than per round, so
+        combining this with ``--speed-every`` still visits every device instead
+        of pinning the tests to the same one.
+        """
         if not devices:
             return set()
         if self.devices_per_round >= len(devices):
+            self.rotation += 1
             return set(devices)
-        start = ((max(1, round_no) - 1) * self.devices_per_round) % len(devices)
+        start = (self.rotation * self.devices_per_round) % len(devices)
+        self.rotation += 1
         return {devices[(start + index) % len(devices)]
                 for index in range(self.devices_per_round)}
 
@@ -436,7 +444,7 @@ def run_round(server, store, history, plotter, params, session, local_name,
               "(Ookla rate limit; {} hit(s) so far)".format(paused, policy.limit_hits))
 
     capable = [name for name in devices if capabilities.get(name) is not False]
-    selected = policy.selection(capable, round_no) if round_params["speed"] else set()
+    selected = policy.selection(capable) if round_params["speed"] else set()
     round_params["speed"] = False  # enabled per device below
 
     print(f"\n[master] round {round_no} starting ({len(slaves)} slave(s) connected)")
